@@ -1,18 +1,12 @@
 """
-Client process (any rank != 0).
+Chat client (any rank != 0) representing one chat user.
 
-A client can act as:
-  - an ORIGIN: creates one message, persists it locally, sends it to the
-    server, and waits for an ACK before deleting it from its own queue.
-  - a DESTINATION: receives messages routed by the server, persists them
-    locally, and sends an ACK back to the server.
-
-Both roles share the same loop below; a single client can be origin and
-destination at the same time (pass destination_rank=None if this client
-should not originate anything).
+Each user has a small scripted list of messages to send to the other
+user (routed through the server), sent at random points in time across
+the simulation. At the same time, every user continuously polls for
+messages addressed to them.
 """
 import random
-import sys
 import time
 import uuid
 
@@ -23,54 +17,91 @@ from persistent_queue import PersistentQueue
 TAG_DATA = 11
 TAG_ACK = 12
 
-SLEEP_MIN, SLEEP_MAX = 0.1, 1.5  # seconds
 
-
-def run_client(comm, rank, total_iterations, destination_rank=None, payload=None):
-    queue = PersistentQueue(f"queue_{rank}.json")
+def run_chat_client(
+    comm,
+    rank,
+    name,
+    destination_rank,
+    total_iterations,
+    sleep_range,
+    messages_to_send=None,
+    offline_at_iteration=None,
+    offline_duration=0,
+):
+    """
+    name:                 display name for this user, e.g. "Alice".
+    destination_rank:     rank of the other chat user.
+    messages_to_send:     list of strings this user will send, one at a
+                          time, at random iterations spread across the run.
+    offline_at_iteration: if set, instead of the normal short random sleep,
+                          this user sleeps for offline_duration seconds at
+                          that iteration, simulating a real disconnection.
+                          Messages sent to it by the other user must still
+                          arrive once it wakes up (that's the whole point
+                          of the chaos demo).
+    """
+    # Two separate persistent queues instead of one shared file:
+    #   outbox -> messages THIS user originated, removed once the server
+    #             confirms delivery (ACK received)
+    #   inbox  -> messages THIS user received, kept as a permanent record
+    #             (this is the user's "mailbox")
+    outbox = PersistentQueue(f"outbox_{name}.json")
+    inbox = PersistentQueue(f"inbox_{name}.json")
     pending_requests = []
-    already_sent = destination_rank is None  # nothing to originate -> skip
-
-    for _ in range(total_iterations):
-        # Simulate local processing time / connection drops.
-        time.sleep(random.uniform(SLEEP_MIN, SLEEP_MAX))
-
+    messages_to_send = list(messages_to_send or [])
+    sleep_min, sleep_max = sleep_range
+ 
+    # decide in advance which iterations will fire a send, so messages are
+    # spread out across the run instead of all sent immediately.
+    send_at_iterations = []
+    if messages_to_send:
+        candidate_iterations = range(1, total_iterations)
+        k = min(len(messages_to_send), len(candidate_iterations))
+        send_at_iterations = sorted(random.sample(candidate_iterations, k=k))
+ 
+    for iteration in range(1, total_iterations + 1):
+        if iteration == offline_at_iteration:
+            print(f"[{name}] going offline for {offline_duration}s (simulating a dropped connection)...", flush=True)
+            time.sleep(offline_duration)
+            print(f"[{name}] back online, catching up on messages", flush=True)
+        else:
+            time.sleep(random.uniform(sleep_min, sleep_max))
+ 
         pending_requests = [r for r in pending_requests if not r.test()[0]]
-
-        # --- Origin behaviour: create and send exactly one message ---
-        if not already_sent:
+ 
+        # --- send a scripted message if this is its scheduled turn ---
+        if send_at_iterations and iteration == send_at_iterations[0]:
+            send_at_iterations.pop(0)
+            text = messages_to_send.pop(0)
             message = {
                 "id": str(uuid.uuid4()),
                 "type": "data",
                 "origem": rank,
                 "destino": destination_rank,
-                "payload": payload,
+                "payload": text,
+                "sender_name": name,
                 "timestamp": time.time(),
             }
-            queue.append(message)
-            print(f"[client {rank}] created {message['id']} for rank {destination_rank}", flush=True)
-
-            # Non-blocking send: the client can go back to sleep right away,
-            # it does not wait for the server to wake up.
+            outbox.append(message)
+            print(f"[{name}] sending: \"{text}\"", flush=True)
             req = comm.isend(message, dest=0, tag=TAG_DATA)
             pending_requests.append(req)
-            already_sent = True
-
-        # --- Destination behaviour: poll for incoming data from the server ---
+ 
+        # --- receive messages addressed to this user ---
         while comm.iprobe(source=0, tag=TAG_DATA):
             msg = comm.recv(source=0, tag=TAG_DATA)
-            queue.append(msg)
-            print(f"[client {rank}] received {msg['id']} from rank {msg['origem']}: {msg['payload']!r}", flush=True)
-
+            inbox.append(msg)
+            print(f"[{name}] received from {msg['sender_name']}: \"{msg['payload']}\"", flush=True)
             ack = {"id": msg["id"], "type": "ack"}
             req = comm.isend(ack, dest=0, tag=TAG_ACK)
             pending_requests.append(req)
-
-        # --- Origin behaviour: poll for the server's ACK, then clean up ---
+ 
+        # --- confirm delivery of messages this user sent earlier ---
         while comm.iprobe(source=0, tag=TAG_ACK):
             ack = comm.recv(source=0, tag=TAG_ACK)
-            queue.remove(ack["id"])
-            print(f"[client {rank}] {ack['id']} confirmed by server, removed locally", flush=True)
-
+            outbox.remove(ack["id"])
+            print(f"[{name}] message {ack['id'][:8]} delivered (removed from local queue)", flush=True)
+ 
     MPI.Request.waitall(pending_requests)
-    print(f"[client {rank}] finished, all pending sends flushed", flush=True)
+    print(f"[{name}] chat session ended", flush=True)
