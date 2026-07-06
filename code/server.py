@@ -49,9 +49,12 @@ def run_server(comm, total_iterations):
                 queue.append(msg)
                 print(f"[server] stored {msg['id']} (from {sender_rank} -> {msg['destino']})", flush=True)
 
+                #only doing what the teacher asked
+                rec_msg = queue.get(msg["id"])
+
                 # forward to the final destination. Non-blocking: if the
                 # destination is asleep, this call still returns immediately.
-                req = comm.isend(msg, dest=msg["destino"], tag=TAG_DATA)
+                req = comm.isend(rec_msg, dest=rec_msg["destino"], tag=TAG_DATA)
                 pending_requests.append(req)
             else:
                 print(f"[server] duplicate {msg['id']} ignored (already processed)", flush=True)

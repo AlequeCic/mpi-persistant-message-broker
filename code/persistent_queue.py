@@ -31,6 +31,15 @@ class PersistentQueue:
         messages.append(message)
         self._write(messages)
 
+    def get(self, message_id):
+        """Recover a single message from disk by id. This is the method
+        that proves a forwarding step actually depends on what's on disk,
+        not just on whatever copy still happens to be sitting in RAM."""
+        for m in self._read():
+            if m["id"] == message_id:
+                return m
+        return None
+
     def remove(self, message_id):
         """Delete a message from disk once its delivery is confirmed."""
         messages = [m for m in self._read() if m["id"] != message_id]
