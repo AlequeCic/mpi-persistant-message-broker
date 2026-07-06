@@ -51,7 +51,20 @@ def run_chat_client(
     pending_requests = []
     messages_to_send = list(messages_to_send or [])
     sleep_min, sleep_max = sleep_range
- 
+    
+    # --- crash recovery: anything still sitting in the outbox from a
+    # previous run was persisted but never got its ACK back, i.e. the
+    # server never confirmed it arrived. Resend it now, straight from
+    # disk. The server deduplicates by id, so resending something that
+    # actually did get through before is harmless. ---
+    leftover_messages = outbox.all()
+    if leftover_messages:
+        print(f"[{name}] recovering {len(leftover_messages)} pending message(s) from outbox_{name}.json", flush=True)
+        for msg in leftover_messages:
+            print(f"[{name}] resending recovered message {msg['id'][:8]}: \"{msg['payload']}\"", flush=True)
+            req = comm.isend(msg, dest=0, tag=TAG_DATA)
+            pending_requests.append(req)
+
     # decide in advance which iterations will fire a send, so messages are
     # spread out across the run instead of all sent immediately.
     send_at_iterations = []
